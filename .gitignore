@@ -1,0 +1,9 @@
+# Python 虚拟环境（本地创建，体积大且与机器相关）
+venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# macOS 系统文件
+.DS_Store

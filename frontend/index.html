@@ -32,6 +32,7 @@
     font: 14px/1 "PingFang SC","Microsoft YaHei",sans-serif;
   }
   #picker button.on { background: rgba(60,160,110,.55); border-color: rgba(150,255,190,.9); color: #fff; }
+  #picker button.tool { border-style: dashed; opacity: .85; }
   #flash-bg {
     position: absolute; inset: 0; pointer-events: none;
     background: radial-gradient(circle at 50% 55%, rgba(150,255,190,.28), transparent 60%);
@@ -44,6 +45,9 @@
 <canvas id="canvas"></canvas>
 <div id="flash-bg"></div>
 <div id="picker"></div><!-- 元素按钮由脚本按 ELEMENTS 注册表自动生成 -->
+<input type="file" id="file-input" accept="image/*" hidden>
+<button id="btn-upload" class="tool">＋ 图片建元素</button>
+<button id="btn-ai-set" class="tool">⚙ AI</button>
 <div id="hint">正在加载手部识别模型…</div>
 
 <script type="module">
@@ -354,6 +358,180 @@ const fireElement = {
 
 const ELEMENTS = { wind: windElement, fire: fireElement };
 
+/* ============ 图片上传 → 自动生成新元素（图像作精灵 + AI 配置） ============ */
+const CUSTOM_STORE = "ffx-custom-elements";
+
+function addPickerButton(key, elCfg) {
+  const b = document.createElement("button");
+  b.textContent = elCfg.label;
+  b.addEventListener("click", () => setElement(key));
+  document.getElementById("picker").appendChild(b);
+  elementBtns[key] = b;
+}
+
+/* 抠掉纯色背景 + 裁剪到内容区，返回 canvas */
+function keyOutAndTrim(img) {
+  const MAX = 300;
+  const sc = Math.min(1, MAX / Math.max(img.width, img.height));
+  const cv = document.createElement("canvas");
+  cv.width = Math.max(2, Math.round(img.width * sc));
+  cv.height = Math.max(2, Math.round(img.height * sc));
+  const c2 = cv.getContext("2d");
+  c2.drawImage(img, 0, 0, cv.width, cv.height);
+  const im = c2.getImageData(0, 0, cv.width, cv.height);
+  const d = im.data;
+  // 取四角中位色当背景色
+  const corners = [[2,2],[cv.width-3,2],[2,cv.height-3],[cv.width-3,cv.height-3]]
+    .map(([x,y]) => [d[(y*cv.width+x)*4], d[(y*cv.width+x)*4+1], d[(y*cv.width+x)*4+2]]);
+  const bg = [0,1,2].map(i => corners.map(c => c[i]).sort((a,b)=>a-b)[Math.floor(corners.length/2)]);
+  // 颜色距离小于容差 → 透明；按距离羽化
+  const TOL = 60, TOL2 = TOL * TOL;
+  let minX = cv.width, minY = cv.height, maxX = 0, maxY = 0;
+  for (let y = 0; y < cv.height; y++) for (let x = 0; x < cv.width; x++) {
+    const i = (y * cv.width + x) * 4;
+    const dist2 = (d[i]-bg[0])**2 + (d[i+1]-bg[1])**2 + (d[i+2]-bg[2])**2;
+    if (dist2 < TOL2) d[i+3] = 0;
+    else if (dist2 < TOL2 * 2.2) d[i+3] = Math.round(d[i+3] * (dist2 - TOL2) / (TOL2 * 1.2));
+    if (d[i+3] > 20) { minX = Math.min(minX,x); maxX = Math.max(maxX,x);
+                       minY = Math.min(minY,y); maxY = Math.max(maxY,y); }
+  }
+  c2.putImageData(im, 0, 0);   // 抠背景后的像素写回画布
+  if (maxX <= minX || maxY <= minY) return cv;
+  const pad = 4;
+  minX = Math.max(0, minX - pad); minY = Math.max(0, minY - pad);
+  maxX = Math.min(cv.width - 1, maxX + pad); maxY = Math.min(cv.height - 1, maxY + pad);
+  const out = document.createElement("canvas");
+  out.width = maxX - minX + 1; out.height = maxY - minY + 1;
+  const part = c2.getImageData(minX, minY, out.width, out.height);
+  out.getContext("2d").putImageData(part, 0, 0);
+  return out;
+}
+
+function defaultSpec(name) {
+  const label = (name || "自定义").replace(/\.[^.]+$/, "").slice(0, 6) || "自定义";
+  return { name, label, hint: label, flashText: label,
+           glow: "rgba(150,255,190,.9)", particleHue: [100, 140], anchor: "tip" };
+}
+
+/* 调用视觉模型（OpenAI 兼容接口，默认智谱 glm-4v-flash 免费），返回 spec 或 null */
+async function callVLM(dataUrl) {
+  const key = localStorage.getItem("ffx-api-key");
+  if (!key) return null;
+  const base = localStorage.getItem("ffx-api-base") || "https://open.bigmodel.cn/api/paas/v4";
+  const model = localStorage.getItem("ffx-api-model") || "glm-4v-flash";
+  const prompt = `看这张特效参考图，为"绕指尖旋转飞行"的特效元素生成配置。只输出 JSON，不要任何其他文字：
+{"name":"英文短标识","label":"中文名(不超过6字)","hint":"底部提示(不超过8字)","flashText":"召唤大字(不超过6字)","glowColor":"rgba(r,g,b,a) 辉光颜色(配合图中主色调)","particleHue":[最小色相,最大色相](0-360,风=绿100-140,火=橙15-35,雷=蓝紫200-240,冰=青180-200),"anchor":"tip"}`;
+  const res = await fetch(base + "/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
+    body: JSON.stringify({ model, messages: [{ role: "user", content: [
+      { type: "text", text: prompt },
+      { type: "image_url", image_url: { url: dataUrl } } ] }],
+      max_tokens: 500 })
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const data = await res.json();
+  let txt = data.choices[0].message.content.replace(/```json|```/g, "").trim();
+  const spec = JSON.parse(txt.slice(txt.indexOf("{"), txt.lastIndexOf("}") + 1));
+  spec.name = (spec.name || "custom").replace(/[^a-z0-9_-]/gi, "").slice(0, 16) || "custom" + Date.now() % 1000;
+  return spec;
+}
+
+function registerImageElement(spec, dataUrl, save) {
+  spec = Object.assign(defaultSpec(spec.name), spec);
+  const existed = !!ELEMENTS[spec.name];        // 已存在 → 直接切换
+  const img = new Image();
+  img.src = dataUrl;
+  const elCfg = {
+    name: spec.name, label: spec.label || spec.name, hint: spec.hint || spec.label,
+    flashText: spec.flashText || spec.label, flashBg: spec.flashBg || "rgba(150,255,190,.28)",
+    flashColor: "#f2fff8", flashShadow: spec.glow || "#7dffb0", flashShadow2: "#2fbf7f",
+    update(s, c) {                                        // 与飞镖一致：指尖锚点公转
+      const tip = c.lm[8], pip = c.lm[6], wrist = c.lm[0];
+      const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+      const fingerUp = d(tip, wrist) > d(pip, wrist) * 1.05 || d(tip, wrist) < POINT_ENTER;
+      if (fingerUp) {
+        if (!s.wasUp && s.alpha < 0.2 && !s.flashed) { summonFlash(); s.flashed = true; }
+        s.target = 1;
+        if (s.alpha < 0.2) { s.x = c.px; s.y = c.py; }
+        s.x += (c.px - s.x) * 0.4; s.y += (c.py - s.y) * 0.4;
+        s.scale = Math.min(2.2, Math.max(0.7, c.size * 3.4));
+        this.spawn(s);
+      } else s.target = 0;
+    },
+    tick(s, dt) { s.orbitAng = (s.orbitAng + dt * ORBIT_SPEED * s.alpha) % (Math.PI * 2); },
+    spawn(s) {
+      if (s.particles.length > 36) return;
+      s.particles.push({ ang: Math.random() * Math.PI * 2,
+        r: 10 + Math.random() * 14, vr: 10 + Math.random() * 12,
+        life: 1, hue: spec.particleHue[0] + Math.random() * (spec.particleHue[1] - spec.particleHue[0]) });
+    },
+    drawHold(s, t, dt) {
+      const bob = Math.sin(t / 260) * 5 * s.scale;
+      const ax = s.x, ay = s.y - 14 * s.scale + bob;
+      // 辉光底 + 精灵图（保持长宽比，最长边约 130*scale）
+      ctx.save();
+      ctx.globalAlpha = s.alpha * 0.9;
+      ctx.shadowColor = spec.glow; ctx.shadowBlur = 26 * s.scale;
+      const w0 = img.naturalWidth || 200, h0 = img.naturalHeight || 200;
+      const L = 130 * s.scale, sc = L / Math.max(w0, h0);
+      if (img.complete && img.naturalWidth) {
+        ctx.drawImage(img, ax - (w0 * sc) / 2, ay - (h0 * sc) / 2 + 10 * s.scale, w0 * sc, h0 * sc);
+      } else {
+        ctx.fillStyle = "#888"; ctx.fillRect(ax - 30, ay - 30, 60, 60);
+      }
+      ctx.restore();
+      // 粒子
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      for (const p of s.particles) {
+        p.ang += 0.09; p.r += p.vr / 60;
+        const px = ax + Math.cos(p.ang) * p.r;
+        const py = ay - 40 * s.scale + Math.sin(p.ang) * p.r * 0.45;
+        ctx.globalAlpha = s.alpha * p.life * 0.9;
+        ctx.fillStyle = `hsl(${p.hue} 100% 75%)`;
+        ctx.beginPath(); ctx.arc(px, py, 2.0 * s.scale * p.life + 0.5, 0, 6.29); ctx.fill();
+      }
+      ctx.restore();
+    }
+  };
+  ELEMENTS[spec.name] = elCfg;
+  if (!existed) addPickerButton(spec.name, elCfg);
+  if (save) {
+    try {
+      const arr = JSON.parse(localStorage.getItem(CUSTOM_STORE) || "[]");
+      const others = arr.filter(c => c.name !== spec.name);
+      others.unshift(Object.assign({}, spec, { sprite: dataUrl }));
+      localStorage.setItem(CUSTOM_STORE, JSON.stringify(others.slice(0, 5)));
+    } catch (e) { console.warn("自定义元素存储失败", e); }
+  }
+}
+
+async function handleUploadFile(file) {
+  if (!file || !file.type.startsWith("image/")) return;
+  hint.textContent = "正在处理图片…";
+  const dataUrl = await new Promise((res) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const img = new Image();
+      img.onload = () => res(keyOutAndTrim(img).toDataURL("image/png"));
+      img.src = r.result;   // FileReader 的结果在自身 .result 上（不是 .target）
+    };
+    r.readAsDataURL(file);
+  });
+  let spec = null;
+  if (localStorage.getItem("ffx-api-key")) {
+    hint.textContent = "AI 正在识别图片…";
+    try { spec = await callVLM(dataUrl); }
+    catch (e) { console.warn("AI 识别失败", e); hint.textContent = "AI 识别失败，已用默认配置"; }
+  } else {
+    hint.textContent = "未配置 AI 密钥，已用默认配置（点 ⚙ 可设置）";
+  }
+  registerImageElement(spec || defaultSpec(file.name), dataUrl, true);
+  setElement(spec ? spec.name : Object.keys(ELEMENTS).pop());
+  if (!hint.classList.contains("err")) hint.textContent = ELEMENTS[ELEMENT].hint;
+}
+
 /* ================= 框架（以下与具体元素无关） ================= */
 
 const swords = [makeSword(), makeSword()];   // 最多追踪两只手
@@ -633,6 +811,31 @@ window.addEventListener("keydown", (e) => {
   if (idx >= 0 && idx < keys.length) setElement(keys[idx]);
 });
 setElement(ELEMENT);
+
+document.getElementById("btn-upload").addEventListener("click",
+  () => document.getElementById("file-input").click());
+document.getElementById("file-input").addEventListener("change", (e) => {
+  handleUploadFile(e.target.files[0]); e.target.value = "";
+});
+document.getElementById("btn-ai-set").addEventListener("click", () => {
+  const key = prompt("粘贴视觉模型的 API Key（留空跳过，效果用默认配置）：",
+    localStorage.getItem("ffx-api-key") || "");
+  if (key === null) return;
+  if (key) localStorage.setItem("ffx-api-key", key); else localStorage.removeItem("ffx-api-key");
+  const base = prompt("API 地址（OpenAI 兼容，直接回车用智谱默认）：",
+    localStorage.getItem("ffx-api-base") || "https://open.bigmodel.cn/api/paas/v4");
+  if (base) localStorage.setItem("ffx-api-base", base);
+  const model = prompt("模型名（直接回车用 glm-4v-flash，免费）：",
+    localStorage.getItem("ffx-api-model") || "glm-4v-flash");
+  if (model) localStorage.setItem("ffx-api-model", model);
+  alert("已保存。上传图片时会自动调用 AI 识别配置。");
+});
+
+// 启动时恢复历史自定义元素
+try {
+  JSON.parse(localStorage.getItem(CUSTOM_STORE) || "[]")
+    .forEach(cfg => registerImageElement(cfg, cfg.sprite, false));
+} catch (e) { console.warn("自定义元素恢复失败", e); }
 
 init();
 </script>
